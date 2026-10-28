@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QByteArray>
+#include <QOpenGLTextureBlitter>
 #include <QOpenGLWidget>
 #include <QPoint>
 #include <QPointer>
@@ -8,6 +9,7 @@
 
 #include <ghostty.h>
 
+#include <memory>
 #include <optional>
 
 class QAction;
@@ -102,10 +104,11 @@ class TerminalWidget final : public QOpenGLWidget {
 
  private slots:
   void cleanupContext();
+  void presentFrame();
+  bool importDmabuf(const ghostty_frame_s& frame);
+  void uploadPixels(const ghostty_frame_s& frame);
 
  private:
-  static ghostty_opengl_proc_t getProcAddress(const char* name);
-  static uint32_t getFramebuffer(void* userdata);
 
   void createSurface();
   void destroySurface();
@@ -133,7 +136,11 @@ class TerminalWidget final : public QOpenGLWidget {
   ghostty_surface_t m_surface = nullptr;
   ghostty_config_t m_appliedConfig = nullptr;
   ghostty_surface_config_s m_config{};
-  bool m_contextRealized = false;
+  // The latest frame from the renderer, held as a texture in our context.
+  std::unique_ptr<QOpenGLTextureBlitter> m_blitter;
+  uint32_t m_frameTexture = 0;
+  QSize m_frameSize;
+  bool m_dmabufUnusable = false;
   bool m_composing = false;
   bool m_suppressLeftMouseRelease = false;
   bool m_focusFollowsMouse = false;

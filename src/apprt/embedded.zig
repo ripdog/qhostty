@@ -28,10 +28,6 @@ const log = std.log.scoped(.embedded_window);
 pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
-    /// OpenGL hosts such as Qt require all drawing on the application thread.
-    /// Metal hosts keep the existing renderer-thread behavior.
-    pub const must_draw_from_app_thread = builtin.target.os.tag == .linux;
-
     /// Because we only expect the embedding API to be used in embedded
     /// environments, the options are extern so that we can expose it
     /// directly to a C callconv and not pay for any translation costs.
@@ -407,16 +403,11 @@ pub const Platform = union(PlatformTag) {
         uiview: objc.Object,
     } else void;
 
-    /// Callbacks supplied by an OpenGL host. The host must make its context
-    /// current before creating, drawing, or destroying the surface.
+    /// An OpenGL host such as Qt. The renderer owns its own EGL context and
+    /// render thread; the host pulls finished frames with
+    /// `ghostty_surface_take_frame` when it receives a render action.
     pub const OpenGL = struct {
-        const Proc = *const fn () callconv(.c) void;
-        pub const GetProcAddress = *const fn ([*:0]const u8) callconv(.c) ?Proc;
-        pub const GetFramebuffer = *const fn (?*anyopaque) callconv(.c) u32;
-
         userdata: ?*anyopaque,
-        get_proc_address: GetProcAddress,
-        get_framebuffer: GetFramebuffer,
     };
 
     // The C ABI compatible version of this union. The tag is expected
@@ -432,8 +423,6 @@ pub const Platform = union(PlatformTag) {
 
         opengl: extern struct {
             userdata: ?*anyopaque,
-            get_proc_address: ?OpenGL.GetProcAddress,
-            get_framebuffer: ?OpenGL.GetFramebuffer,
         },
     };
 
@@ -455,16 +444,7 @@ pub const Platform = union(PlatformTag) {
                 break :ios .{ .ios = .{ .uiview = uiview } };
             } else error.UnsupportedPlatform,
 
-            .opengl => opengl: {
-                const config = c_platform.opengl;
-                break :opengl .{ .opengl = .{
-                    .userdata = config.userdata,
-                    .get_proc_address = config.get_proc_address orelse
-                        break :opengl error.OpenGLGetProcAddressMustBeSet,
-                    .get_framebuffer = config.get_framebuffer orelse
-                        break :opengl error.OpenGLGetFramebufferMustBeSet,
-                } };
-            },
+            .opengl => .{ .opengl = .{ .userdata = c_platform.opengl.userdata } },
         };
     }
 };
@@ -1041,6 +1021,10 @@ pub const Surface = struct {
     }
 
     pub fn draw(self: *Surface) void {
+        // OpenGL renderers own their GL context on the render thread, so the
+        // host can't force a draw from its own thread.
+        if (self.platform == .opengl) return;
+
         self.core_surface.draw() catch |err| {
             log.err("error in draw err={}", .{err});
             return;
@@ -1602,6 +1586,30 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
+    /// A rendered frame handed to an OpenGL host. Mirrors `ghostty_frame_s`.
+    pub const Frame = extern struct {
+        pub const Kind = enum(c_int) { none = 0, dmabuf = 1, memory = 2 };
+
+        kind: Kind = .none,
+        width: u32 = 0,
+        height: u32 = 0,
+        premultiplied: bool = false,
+
+        /// `memory`: tightly packed RGBA8 rows, `width * 4` bytes each.
+        pixels: ?[*]const u8 = null,
+
+        /// `dmabuf`: the format and its planes. The fds stay owned by the
+        /// frame and are closed by `ghostty_frame_release`.
+        fourcc: u32 = 0,
+        modifier: u64 = 0,
+        plane_count: u32 = 0,
+        fds: [4]c_int = @splat(-1),
+        offsets: [4]c_int = @splat(0),
+        strides: [4]c_int = @splat(0),
+
+        handle: ?*anyopaque = null,
+    };
+
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -2099,31 +2107,87 @@ pub const CAPI = struct {
         surface.draw();
     }
 
-    /// Release GPU resources before an embedded OpenGL context is destroyed.
-    /// The host must make the context current before calling this function.
-    export fn ghostty_surface_opengl_unrealize(surface: *Surface) bool {
-        switch (surface.platform) {
-            .opengl => {
-                surface.core_surface.renderer.displayUnrealized();
-                return true;
-            },
-            else => return false,
-        }
+    /// Tell the renderer that the host display is gone, for example because
+    /// the window is hidden or being destroyed. GPU resources are released on
+    /// the render thread.
+    export fn ghostty_surface_display_unrealized(surface: *Surface) void {
+        surface.core_surface.displayUnrealized();
     }
 
-    /// Recreate GPU resources after an embedded OpenGL context is created.
-    /// The host must make the context current before calling this function.
-    export fn ghostty_surface_opengl_realize(surface: *Surface) bool {
-        switch (surface.platform) {
-            .opengl => {
-                surface.core_surface.renderer.displayRealized() catch |err| {
-                    log.err("error realizing OpenGL surface err={}", .{err});
-                    return false;
-                };
-                return true;
+    /// Tell the renderer that the host display is available again.
+    export fn ghostty_surface_display_realized(surface: *Surface) bool {
+        surface.core_surface.displayRealized() catch |err| {
+            log.err("error realizing surface err={}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    /// Take the most recent frame produced by the renderer, if any. The
+    /// host owns the frame until it calls `ghostty_frame_release`.
+    export fn ghostty_surface_take_frame(
+        surface: *Surface,
+        out: *Frame,
+    ) bool {
+        const Exported = renderer.Renderer.ExportedFrame;
+        if (comptime Exported == void) return false;
+
+        const frame = surface.core_surface.renderer.takeFrame() orelse return false;
+        const handle = surface.app.core_app.alloc.create(Exported) catch {
+            frame.deinit();
+            return false;
+        };
+        handle.* = frame;
+
+        out.* = .{ .handle = handle };
+        switch (frame) {
+            .dmabuf => |v| {
+                out.kind = .dmabuf;
+                out.width = v.width;
+                out.height = v.height;
+                out.fourcc = v.fourcc;
+                out.modifier = v.modifier;
+                out.premultiplied = v.premultiplied;
+                out.plane_count = v.planes.count;
+                for (0..v.planes.count) |i| {
+                    out.fds[i] = v.planes.fds[i];
+                    out.offsets[i] = v.planes.offsets[i];
+                    out.strides[i] = v.planes.strides[i];
+                }
             },
-            else => return false,
+            .memory => |v| {
+                out.kind = .memory;
+                out.width = v.width;
+                out.height = v.height;
+                out.premultiplied = true;
+                out.pixels = v.pixels.ptr;
+            },
         }
+        return true;
+    }
+
+    /// Release a frame obtained from `ghostty_surface_take_frame`,
+    /// closing its file descriptors or freeing its pixels.
+    export fn ghostty_frame_release(surface: *Surface, frame: *Frame) void {
+        const Exported = renderer.Renderer.ExportedFrame;
+        if (comptime Exported == void) return;
+
+        const handle: *Exported = @ptrCast(@alignCast(frame.handle orelse return));
+        handle.deinit();
+        surface.app.core_app.alloc.destroy(handle);
+        frame.* = .{};
+    }
+
+    /// Tell the renderer whether the host can present the frames it
+    /// exports. When unhealthy, the renderer exports CPU pixels instead
+    /// of DMABUFs.
+    export fn ghostty_surface_report_presentation_health(
+        surface: *Surface,
+        healthy: bool,
+    ) void {
+        surface.core_surface.reportPresentationHealth(
+            if (healthy) .healthy else .unhealthy,
+        );
     }
 
     /// Update the size of a surface. This will trigger resize notifications

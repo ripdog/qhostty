@@ -496,15 +496,33 @@ typedef struct {
   void* uiview;
 } ghostty_platform_ios_s;
 
-typedef void (*ghostty_opengl_proc_t)(void);
-typedef ghostty_opengl_proc_t (*ghostty_opengl_get_proc_address_cb)(const char*);
-typedef uint32_t (*ghostty_opengl_get_framebuffer_cb)(void*);
-
 typedef struct {
   void* userdata;
-  ghostty_opengl_get_proc_address_cb get_proc_address;
-  ghostty_opengl_get_framebuffer_cb get_framebuffer;
 } ghostty_platform_opengl_s;
+
+typedef enum {
+  GHOSTTY_FRAME_NONE,
+  GHOSTTY_FRAME_DMABUF,
+  GHOSTTY_FRAME_MEMORY,
+} ghostty_frame_kind_e;
+
+// A rendered frame from ghostty_surface_take_frame. Memory frames carry
+// tightly packed premultiplied RGBA8 rows; DMABUF frames carry up to four
+// planes. Release it with ghostty_frame_release.
+typedef struct {
+  ghostty_frame_kind_e kind;
+  uint32_t width;
+  uint32_t height;
+  bool premultiplied;
+  const uint8_t* pixels;
+  uint32_t fourcc;
+  uint64_t modifier;
+  uint32_t plane_count;
+  int fds[4];
+  int offsets[4];
+  int strides[4];
+  void* handle;
+} ghostty_frame_s;
 
 typedef union {
   ghostty_platform_macos_s macos;
@@ -1211,8 +1229,11 @@ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
-GHOSTTY_API bool ghostty_surface_opengl_unrealize(ghostty_surface_t);
-GHOSTTY_API bool ghostty_surface_opengl_realize(ghostty_surface_t);
+GHOSTTY_API void ghostty_surface_display_unrealized(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_display_realized(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_take_frame(ghostty_surface_t, ghostty_frame_s*);
+GHOSTTY_API void ghostty_frame_release(ghostty_surface_t, ghostty_frame_s*);
+GHOSTTY_API void ghostty_surface_report_presentation_health(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);

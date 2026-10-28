@@ -24,6 +24,8 @@
 #include <QMessageBox>
 #include <QMimeData>
 #include <QMouseEvent>
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <QOpenGLContext>
 #include <QOpenGLFunctions>
 #include <QPalette>
@@ -44,6 +46,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 
 TerminalWidget::TerminalWidget(GhosttyApp* app,
                                QWidget* parent,
@@ -733,24 +736,42 @@ void TerminalWidget::initializeGL() {
   connect(context(), &QOpenGLContext::aboutToBeDestroyed, this,
           &TerminalWidget::cleanupContext, Qt::DirectConnection);
 
+  m_blitter = std::make_unique<QOpenGLTextureBlitter>();
+  m_blitter->create();
+
   if (m_surface == nullptr) {
     createSurface();
-  } else if (!m_contextRealized) {
-    m_contextRealized = ghostty_surface_opengl_realize(m_surface);
   }
 
   syncSurfaceMetrics();
 }
 
 void TerminalWidget::paintGL() {
-  if (m_surface == nullptr || !m_contextRealized) {
+  QOpenGLFunctions* gl = context()->functions();
+  gl->glClearColor(0, 0, 0, 1);
+  gl->glClear(GL_COLOR_BUFFER_BIT);
+  if (m_surface == nullptr) {
     return;
   }
 
+  presentFrame();
+  if (m_frameTexture == 0 || !m_blitter->isCreated()) {
+    return;
+  }
+
+  // The renderer draws bottom-up at device-pixel size. Keep one texel per
+  // device pixel, anchored top-left, so a frame that lags a resize is cropped
+  // or padded instead of stretched.
   const qreal scale = devicePixelRatioF();
-  context()->functions()->glViewport(0, 0, qRound(width() * scale),
-                                     qRound(height() * scale));
-  ghostty_surface_draw(m_surface);
+  const QRect viewport(0, 0, qRound(width() * scale), qRound(height() * scale));
+  const QRect target(QPoint(0, 0), m_frameSize);
+  gl->glDisable(GL_BLEND);
+  m_blitter->bind();
+  m_blitter->setRedBlueSwizzle(false);
+  m_blitter->blit(m_frameTexture,
+                  QOpenGLTextureBlitter::targetTransform(target, viewport),
+                  QOpenGLTextureBlitter::OriginBottomLeft);
+  m_blitter->release();
 }
 
 void TerminalWidget::resizeGL(int, int) {
@@ -950,31 +971,22 @@ bool TerminalWidget::eventFilter(QObject* watched, QEvent* event) {
 }
 
 void TerminalWidget::cleanupContext() {
-  if (m_surface == nullptr || !m_contextRealized || context() == nullptr) {
+  if (context() == nullptr) {
     return;
   }
 
   makeCurrent();
-  ghostty_surface_opengl_unrealize(m_surface);
-  m_contextRealized = false;
+  if (m_frameTexture != 0) {
+    context()->functions()->glDeleteTextures(1, &m_frameTexture);
+    m_frameTexture = 0;
+  }
+  m_blitter.reset();
   doneCurrent();
-}
-
-ghostty_opengl_proc_t TerminalWidget::getProcAddress(const char* name) {
-  QOpenGLContext* current = QOpenGLContext::currentContext();
-  return current == nullptr ? nullptr : current->getProcAddress(name);
-}
-
-uint32_t TerminalWidget::getFramebuffer(void* userdata) {
-  auto* widget = static_cast<TerminalWidget*>(userdata);
-  return widget == nullptr ? 0 : widget->defaultFramebufferObject();
 }
 
 void TerminalWidget::createSurface() {
   m_config.platform_tag = GHOSTTY_PLATFORM_OPENGL;
   m_config.platform.opengl.userdata = this;
-  m_config.platform.opengl.get_proc_address = &TerminalWidget::getProcAddress;
-  m_config.platform.opengl.get_framebuffer = &TerminalWidget::getFramebuffer;
   m_config.userdata = this;
   m_config.scale_factor = devicePixelRatioF();
   m_config.working_directory = m_workingDirectoryUtf8.isEmpty()
@@ -986,9 +998,18 @@ void TerminalWidget::createSurface() {
       m_initialInputUtf8.isEmpty() ? nullptr : m_initialInputUtf8.constData();
 
   m_surface = ghostty_surface_new(m_app->handle(), &m_config);
-  m_contextRealized = m_surface != nullptr;
   if (m_surface == nullptr) {
     qCritical("Failed to create Ghostty OpenGL surface");
+    return;
+  }
+
+  // The renderer exports DMABUFs only when we say we can import them.
+  m_dmabufUnusable = qEnvironmentVariableIsSet("QHOSTTY_CPU_PRESENT") ||
+                     context() == nullptr ||
+                     context()->nativeInterface<QNativeInterface::QEGLContext>() ==
+                         nullptr;
+  if (m_dmabufUnusable) {
+    ghostty_surface_report_presentation_health(m_surface, false);
   }
 }
 
@@ -997,15 +1018,142 @@ void TerminalWidget::destroySurface() {
     return;
   }
 
-  if (context() != nullptr && context()->isValid()) {
-    makeCurrent();
-    ghostty_surface_free(m_surface);
-    doneCurrent();
-  } else {
-    ghostty_surface_free(m_surface);
-  }
+  ghostty_surface_free(m_surface);
   m_surface = nullptr;
-  m_contextRealized = false;
+}
+
+void TerminalWidget::presentFrame() {
+  ghostty_frame_s frame{};
+  if (!ghostty_surface_take_frame(m_surface, &frame)) {
+    return;
+  }
+
+  bool presented = false;
+  if (frame.kind == GHOSTTY_FRAME_DMABUF) {
+    presented = importDmabuf(frame);
+    if (!presented && !m_dmabufUnusable) {
+      qWarning("Failed to import a Ghostty DMABUF; using CPU presentation");
+      m_dmabufUnusable = true;
+      ghostty_surface_report_presentation_health(m_surface, false);
+    }
+  } else if (frame.kind == GHOSTTY_FRAME_MEMORY && frame.pixels != nullptr) {
+    uploadPixels(frame);
+    presented = true;
+  }
+
+  if (presented) {
+    static bool loggedDmabuf = false;
+    static bool loggedMemory = false;
+    bool& logged = frame.kind == GHOSTTY_FRAME_DMABUF ? loggedDmabuf : loggedMemory;
+    if (!logged) {
+      logged = true;
+      qInfo("Presenting Ghostty frames via %s (%ux%u)",
+            frame.kind == GHOSTTY_FRAME_DMABUF ? "DMABUF import"
+                                               : "CPU pixel upload",
+            frame.width, frame.height);
+    }
+    m_frameSize = QSize(static_cast<int>(frame.width),
+                        static_cast<int>(frame.height));
+  }
+  ghostty_frame_release(m_surface, &frame);
+}
+
+void TerminalWidget::uploadPixels(const ghostty_frame_s& frame) {
+  QOpenGLFunctions* gl = context()->functions();
+  const bool created = m_frameTexture == 0;
+  if (created) {
+    gl->glGenTextures(1, &m_frameTexture);
+  }
+  gl->glBindTexture(GL_TEXTURE_2D, m_frameTexture);
+  const auto width = static_cast<GLsizei>(frame.width);
+  const auto height = static_cast<GLsizei>(frame.height);
+  if (created || m_frameSize != QSize(width, height)) {
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl->glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, frame.pixels);
+  } else {
+    gl->glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA,
+                        GL_UNSIGNED_BYTE, frame.pixels);
+  }
+  gl->glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+bool TerminalWidget::importDmabuf(const ghostty_frame_s& frame) {
+  if (m_dmabufUnusable) {
+    return false;
+  }
+  const auto* egl = context()->nativeInterface<QNativeInterface::QEGLContext>();
+  if (egl == nullptr || frame.plane_count == 0 || frame.plane_count > 4) {
+    return false;
+  }
+
+  using EglImageTargetTexture2D = void (*)(GLenum, void*);
+  static const auto imageTargetTexture2D =
+      reinterpret_cast<EglImageTargetTexture2D>(
+          eglGetProcAddress("glEGLImageTargetTexture2DOES"));
+  if (imageTargetTexture2D == nullptr) {
+    return false;
+  }
+
+  // Per-plane attribute names, in plane order.
+  static constexpr EGLint planeAttribs[4][5] = {
+      {EGL_DMA_BUF_PLANE0_FD_EXT, EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+       EGL_DMA_BUF_PLANE0_PITCH_EXT, EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+       EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT},
+      {EGL_DMA_BUF_PLANE1_FD_EXT, EGL_DMA_BUF_PLANE1_OFFSET_EXT,
+       EGL_DMA_BUF_PLANE1_PITCH_EXT, EGL_DMA_BUF_PLANE1_MODIFIER_LO_EXT,
+       EGL_DMA_BUF_PLANE1_MODIFIER_HI_EXT},
+      {EGL_DMA_BUF_PLANE2_FD_EXT, EGL_DMA_BUF_PLANE2_OFFSET_EXT,
+       EGL_DMA_BUF_PLANE2_PITCH_EXT, EGL_DMA_BUF_PLANE2_MODIFIER_LO_EXT,
+       EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT},
+      {EGL_DMA_BUF_PLANE3_FD_EXT, EGL_DMA_BUF_PLANE3_OFFSET_EXT,
+       EGL_DMA_BUF_PLANE3_PITCH_EXT, EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT,
+       EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT},
+  };
+
+  std::vector<EGLAttrib> attribs = {
+      EGL_WIDTH,
+      static_cast<EGLAttrib>(frame.width),
+      EGL_HEIGHT,
+      static_cast<EGLAttrib>(frame.height),
+      EGL_LINUX_DRM_FOURCC_EXT,
+      static_cast<EGLAttrib>(frame.fourcc),
+  };
+  for (uint32_t i = 0; i < frame.plane_count; ++i) {
+    const EGLint* names = planeAttribs[i];
+    attribs.insert(attribs.end(),
+                   {names[0], frame.fds[i], names[1], frame.offsets[i],
+                    names[2], frame.strides[i], names[3],
+                    static_cast<EGLAttrib>(frame.modifier & 0xffffffffu),
+                    names[4], static_cast<EGLAttrib>(frame.modifier >> 32)});
+  }
+  attribs.push_back(EGL_NONE);
+
+  EGLImage image = eglCreateImage(egl->display(), EGL_NO_CONTEXT,
+                                  EGL_LINUX_DMA_BUF_EXT, nullptr,
+                                  attribs.data());
+  if (image == EGL_NO_IMAGE) {
+    return false;
+  }
+
+  QOpenGLFunctions* gl = context()->functions();
+  if (m_frameTexture == 0) {
+    gl->glGenTextures(1, &m_frameTexture);
+  }
+  gl->glBindTexture(GL_TEXTURE_2D, m_frameTexture);
+  gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  gl->glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  imageTargetTexture2D(GL_TEXTURE_2D, image);
+  gl->glBindTexture(GL_TEXTURE_2D, 0);
+
+  // The texture keeps its own reference to the buffer.
+  eglDestroyImage(egl->display(), image);
+  return gl->glGetError() == GL_NO_ERROR;
 }
 
 void TerminalWidget::syncSurfaceMetrics() {
