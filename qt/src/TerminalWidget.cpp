@@ -7,6 +7,7 @@
 
 #include <QAction>
 #include <QApplication>
+#include <QCheckBox>
 #include <QClipboard>
 #include <QDesktopServices>
 #include <QFileDialog>
@@ -255,51 +256,141 @@ void TerminalWidget::freeInheritedConfig(
   }
 }
 
-bool TerminalWidget::readClipboard(ghostty_clipboard_e location, void* state) {
-  if (m_surface == nullptr) {
-    return false;
+ghostty_clipboard_read_result_e TerminalWidget::readClipboard(
+    ghostty_clipboard_e location,
+    void* state,
+    const char* const* mimes,
+    size_t mimeCount,
+    bool list) {
+  if (m_surface == nullptr || location == GHOSTTY_CLIPBOARD_PRIMARY) {
+    return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED;
   }
 
   QClipboard* clipboard = QGuiApplication::clipboard();
   if (location == GHOSTTY_CLIPBOARD_SELECTION &&
       !clipboard->supportsSelection()) {
-    return false;
+    return GHOSTTY_CLIPBOARD_READ_UNSUPPORTED;
   }
   const QClipboard::Mode mode = location == GHOSTTY_CLIPBOARD_SELECTION
                                     ? QClipboard::Selection
                                     : QClipboard::Clipboard;
   const QMimeData* mime = clipboard->mimeData(mode);
-  if (mime == nullptr || !mime->hasText()) {
-    return false;
+  if (mime == nullptr) {
+    return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
   }
 
-  const QByteArray text = mime->text().toUtf8();
-  ghostty_surface_complete_clipboard_request(m_surface, text.constData(), state,
-                                             false);
-  return true;
+  // Serve exactly the representations that were asked for.
+  std::vector<QByteArray> mimeNames;
+  std::vector<QByteArray> payloads;
+  for (size_t index = 0; index < mimeCount; ++index) {
+    const QByteArray name(mimes[index]);
+    QByteArray payload;
+    if (name == "text/plain") {
+      if (mime->hasText()) {
+        payload = mime->text().toUtf8();
+      }
+    } else if (mime->hasFormat(QString::fromUtf8(name))) {
+      payload = mime->data(QString::fromUtf8(name));
+    }
+    if (payload.isEmpty()) {
+      continue;
+    }
+    mimeNames.push_back(name);
+    payloads.push_back(payload);
+  }
+
+  // The listing of everything on the clipboard, when asked for.
+  std::vector<QByteArray> availableNames;
+  if (list) {
+    for (const QString& format : mime->formats()) {
+      availableNames.push_back(format.toUtf8());
+    }
+    if (mime->hasText() &&
+        std::ranges::find(availableNames, QByteArray("text/plain")) ==
+            availableNames.end()) {
+      availableNames.push_back(QByteArray("text/plain"));
+    }
+  }
+
+  if (payloads.empty() && availableNames.empty()) {
+    return GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+  }
+
+  std::vector<ghostty_clipboard_content_s> contents;
+  for (size_t index = 0; index < payloads.size(); ++index) {
+    contents.push_back({mimeNames[index].constData(), payloads[index].constData(),
+                        static_cast<size_t>(payloads[index].size())});
+  }
+  std::vector<const char*> available;
+  for (const QByteArray& name : availableNames) {
+    available.push_back(name.constData());
+  }
+
+  const ghostty_clipboard_complete_s complete{
+      .contents = contents.data(),
+      .contents_len = contents.size(),
+      .available = available.data(),
+      .available_len = available.size(),
+      .confirmed = false,
+      .remember = false,
+  };
+  ghostty_surface_complete_clipboard_request(m_surface, &complete, state);
+  return GHOSTTY_CLIPBOARD_READ_STARTED;
 }
 
-void TerminalWidget::confirmReadClipboard(const char* contents,
-                                          void* state,
-                                          ghostty_clipboard_request_e request) {
-  if (m_surface == nullptr) {
+void TerminalWidget::confirmReadClipboard(
+    const ghostty_clipboard_confirm_s* confirm,
+    void* state,
+    ghostty_clipboard_request_e request) {
+  if (m_surface == nullptr || confirm == nullptr) {
     return;
   }
 
+  QString preview;
+  for (size_t index = 0; index < confirm->contents_len; ++index) {
+    const ghostty_clipboard_content_s& content = confirm->contents[index];
+    if (content.mime != nullptr && content.data != nullptr &&
+        std::strcmp(content.mime, "text/plain") == 0) {
+      preview = QString::fromUtf8(content.data,
+                                  static_cast<qsizetype>(content.len))
+                    .left(500);
+      break;
+    }
+  }
+
+  const QString requester =
+      confirm->name != nullptr && confirm->name[0] != '\0'
+          ? QString::fromUtf8(confirm->name)
+          : tr("The terminal");
   const QString operation =
       request == GHOSTTY_CLIPBOARD_REQUEST_PASTE
           ? tr("Paste clipboard contents into the terminal?")
-          : tr("Allow the terminal to read the clipboard?");
-  const QString preview = QString::fromUtf8(contents).left(500);
-  const auto answer = QMessageBox::question(
-      this, tr("Clipboard confirmation"),
-      operation + QStringLiteral("\n\n") + preview,
-      QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+          : tr("Allow %1 to read the clipboard?").arg(requester);
 
-  const QByteArray data =
-      answer == QMessageBox::Yes ? QByteArray(contents) : QByteArray();
-  ghostty_surface_complete_clipboard_request(m_surface, data.constData(), state,
-                                             true);
+  QMessageBox box(QMessageBox::Question, tr("Clipboard confirmation"),
+                  preview.isEmpty() ? operation
+                                    : operation + QStringLiteral("\n\n") + preview,
+                  QMessageBox::Yes | QMessageBox::No, this);
+  box.setDefaultButton(QMessageBox::No);
+  auto* remember = new QCheckBox(tr("Remember this choice for the session"), &box);
+  remember->setVisible(confirm->can_remember);
+  box.setCheckBox(remember);
+
+  if (box.exec() != QMessageBox::Yes) {
+    ghostty_surface_deny_clipboard_request(m_surface, state);
+    return;
+  }
+
+  // The contents are only borrowed for this call, so complete before it ends.
+  const ghostty_clipboard_complete_s complete{
+      .contents = confirm->contents,
+      .contents_len = confirm->contents_len,
+      .available = confirm->available,
+      .available_len = confirm->available_len,
+      .confirmed = true,
+      .remember = confirm->can_remember && remember->isChecked(),
+  };
+  ghostty_surface_complete_clipboard_request(m_surface, &complete, state);
 }
 
 void TerminalWidget::writeClipboard(ghostty_clipboard_e location,

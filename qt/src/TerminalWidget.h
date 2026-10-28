@@ -50,8 +50,12 @@ class TerminalWidget final : public QOpenGLWidget {
       ghostty_surface_context_e context) const;
   void freeInheritedConfig(ghostty_surface_config_s& config) const;
 
-  bool readClipboard(ghostty_clipboard_e location, void* state);
-  void confirmReadClipboard(const char* contents,
+  ghostty_clipboard_read_result_e readClipboard(ghostty_clipboard_e location,
+                                                void* state,
+                                                const char* const* mimes,
+                                                size_t mimeCount,
+                                                bool list);
+  void confirmReadClipboard(const ghostty_clipboard_confirm_s* confirm,
                             void* state,
                             ghostty_clipboard_request_e request);
   void writeClipboard(ghostty_clipboard_e location,
