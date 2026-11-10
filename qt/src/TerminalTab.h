@@ -31,6 +31,7 @@ class TerminalTab final : public QWidget {
   void equalizeSplits();
   void toggleZoom();
   bool canClose() const;
+  bool needsCloseConfirmation() const;
 
  signals:
   void titleChanged(const QString& title);

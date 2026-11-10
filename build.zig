@@ -89,6 +89,8 @@ pub fn build(b: *std.Build) !void {
 
     // Ghostty resources like terminfo, shell integration, themes, etc.
     const resources = try buildpkg.GhosttyResources.init(b, &config, &deps);
+    const resources_step = b.step("resources", "Install terminal runtime resources");
+    for (resources.steps) |step| resources_step.dependOn(step);
     const i18n = if (config.i18n) try buildpkg.GhosttyI18n.init(b, &config) else null;
 
     // Ghostty executable, the actual runnable Ghostty program.

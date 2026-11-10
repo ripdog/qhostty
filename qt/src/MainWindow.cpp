@@ -10,6 +10,7 @@
 #include <QEvent>
 #include <QInputDialog>
 #include <QMenu>
+#include <QMessageBox>
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTimer>
@@ -60,7 +61,8 @@ MainWindow::MainWindow(GhosttyApp* app,
       }
     }
   });
-  connect(m_tabBar, &QTabBar::tabCloseRequested, this, &MainWindow::closeTab);
+  connect(m_tabBar, &QTabBar::tabCloseRequested, this,
+          [this](int index) { closeTab(index); });
   connect(m_tabBar, &QTabBar::tabMoved, this, [this](int from, int to) {
     QWidget* page = m_stack->widget(from);
     if (page == nullptr) {
@@ -313,8 +315,12 @@ TerminalTab* MainWindow::currentTab() const {
 bool MainWindow::canClose() const {
   for (int index = 0; index < m_stack->count(); ++index) {
     auto* tab = qobject_cast<TerminalTab*>(m_stack->widget(index));
-    if (tab != nullptr && !tab->canClose()) {
-      return false;
+    if (tab != nullptr && tab->needsCloseConfirmation()) {
+      return QMessageBox::question(
+                 const_cast<MainWindow*>(this), tr("Close window?"),
+                 tr("One or more processes are still running in this window."),
+                 QMessageBox::Close | QMessageBox::Cancel,
+                 QMessageBox::Cancel) == QMessageBox::Close;
     }
   }
   return true;
@@ -362,13 +368,13 @@ TerminalTab* MainWindow::tabFor(TerminalWidget* terminal) const {
   return nullptr;
 }
 
-void MainWindow::closeTab(int index) {
+void MainWindow::closeTab(int index, bool confirmed) {
   if (index < 0 || index >= m_stack->count()) {
     return;
   }
 
   auto* tab = qobject_cast<TerminalTab*>(m_stack->widget(index));
-  if (tab == nullptr || !tab->canClose()) {
+  if (tab == nullptr || (!confirmed && !tab->canClose())) {
     return;
   }
 
@@ -416,7 +422,10 @@ void MainWindow::connectTab(TerminalTab* tab) {
   connect(tab, &TerminalTab::titleChanged, this,
           [this, tab](const QString& title) { updateTabTitle(tab, title); });
   connect(tab, &TerminalTab::closeRequested, this,
-          [this](TerminalTab* page) { closeTab(m_stack->indexOf(page)); });
+          [this](TerminalTab* page) {
+            // The last surface has already approved its close (or exited).
+            closeTab(m_stack->indexOf(page), true);
+          });
   connect(tab, &TerminalTab::configChanged, this, &MainWindow::applyConfig);
 }
 

@@ -166,6 +166,13 @@ install(FILES "${GHOSTTY_SHARED}"
   DESTINATION "${CMAKE_INSTALL_LIBDIR}/qhostty"
   RENAME "libghostty.so"
 )
+# Keep our matching runtime data private so installation can coexist with
+# distribution-provided Ghostty shell integration and terminfo packages.
+install(DIRECTORY
+  "${GHOSTTY_PREFIX}/share/ghostty"
+  "${GHOSTTY_PREFIX}/share/terminfo"
+  DESTINATION "${CMAKE_INSTALL_DATADIR}/qhostty"
+)
 install(FILES resources/linux/${QHOSTTY_APP_ID}.desktop
   DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
 install(FILES resources/linux/${QHOSTTY_APP_ID}.metainfo.xml

@@ -97,6 +97,17 @@ pub fn resourcesDir(alloc: Allocator) !ResourcesDir {
         // is valid even on Mac since there is nothing that requires
         // Ghostty to be in an app bundle.
         inline for (sentinels) |sentinel| {
+            // Qhostty installs matching runtime data in a private directory
+            // to coexist with a system Ghostty installation.
+            if (try maybeDir(
+                &dir_buf,
+                dir,
+                "share/qhostty",
+                sentinel,
+            )) |v| {
+                return .{ .app_path = try std.fs.path.join(alloc, &.{ v, "ghostty" }) };
+            }
+
             if (try maybeDir(
                 &dir_buf,
                 dir,

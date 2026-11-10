@@ -17,6 +17,7 @@ file(MAKE_DIRECTORY "${GHOSTTY_PREFIX}/include")
 
 add_custom_target(qhostty_libghostty
   COMMAND "${ZIG_EXECUTABLE}" build
+    install resources
     -Demit-lib-vt=false
     -Dapp-runtime=none
     -Drenderer=opengl
@@ -32,6 +33,10 @@ add_custom_target(qhostty_libghostty
     --prefix "${GHOSTTY_PREFIX}"
   COMMAND "${CMAKE_COMMAND}" -E create_symlink
     "ghostty-internal.so" "${GHOSTTY_SONAME}"
+  # The core discovers resources beside the running executable via terminfo.
+  # Keep build-tree launches working without a system Ghostty installation.
+  COMMAND "${CMAKE_COMMAND}" -E copy_directory
+    "${GHOSTTY_PREFIX}/share" "${CMAKE_BINARY_DIR}/share"
   WORKING_DIRECTORY "${GHOSTTY_SOURCE_DIR}"
   BYPRODUCTS
     "${GHOSTTY_SHARED}"

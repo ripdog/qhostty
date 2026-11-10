@@ -60,7 +60,7 @@ class MainWindow final : public QMainWindow {
   };
 
   TerminalTab* tabFor(TerminalWidget* terminal) const;
-  void closeTab(int index);
+  void closeTab(int index, bool confirmed = false);
   void detachTab(int index);
   void connectTab(TerminalTab* tab);
   void updateTabTitle(TerminalTab* tab, const QString& title);

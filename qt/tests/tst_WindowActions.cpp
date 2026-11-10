@@ -14,6 +14,7 @@
 #include <QMenu>
 #include <QProgressBar>
 #include <QScrollBar>
+#include <QSplitter>
 #include <QStackedWidget>
 #include <QTabBar>
 #include <QTemporaryFile>
@@ -78,6 +79,8 @@ class WindowActionsTest final : public QObject {
 
  private slots:
   void routesTabAndSplitActions();
+  void dividesSourcePaneEqually_data();
+  void dividesSourcePaneEqually();
   void routesTerminalStateActions();
   void calculatesQuickTerminalGeometry();
   void enumeratesGlobalBindings();
@@ -85,6 +88,48 @@ class WindowActionsTest final : public QObject {
   void keepsTabAsTerminalInput();
   void controlsTabBarVisibility();
 };
+
+void WindowActionsTest::dividesSourcePaneEqually_data() {
+  QTest::addColumn<int>("direction");
+  QTest::newRow("left") << int(GHOSTTY_SPLIT_DIRECTION_LEFT);
+  QTest::newRow("right") << int(GHOSTTY_SPLIT_DIRECTION_RIGHT);
+  QTest::newRow("up") << int(GHOSTTY_SPLIT_DIRECTION_UP);
+  QTest::newRow("down") << int(GHOSTTY_SPLIT_DIRECTION_DOWN);
+}
+
+void WindowActionsTest::dividesSourcePaneEqually() {
+  QFETCH(int, direction);
+  const auto splitDirection =
+      static_cast<ghostty_action_split_direction_e>(direction);
+  GhosttyApp ghostty;
+  QVERIFY(ghostty.initialize());
+  TerminalTab tab(&ghostty);
+  tab.resize(1200, 900);
+  tab.show();
+  auto* source = tab.activeTerminal();
+  // The existing surface has received its size limits while the new
+  // surface may not have initialized yet.
+  source->setMinimumSize(160, 100);
+  auto* sibling = tab.newSplit(source, splitDirection);
+  QVERIFY(sibling != nullptr);
+  QCoreApplication::processEvents();
+  auto* splitter = qobject_cast<QSplitter*>(source->parentWidget());
+  QVERIFY(splitter != nullptr);
+  QTRY_VERIFY(qAbs(splitter->sizes().at(0) - splitter->sizes().at(1)) <= 1);
+  splitter->setSizes({600, 300});
+  const int siblingSize = splitter->sizes().at(splitter->indexOf(sibling));
+  const int sourceSize = splitter->sizes().at(splitter->indexOf(source));
+
+  auto* added = tab.newSplit(source, splitDirection);
+  QVERIFY(added != nullptr);
+  QCoreApplication::processEvents();
+  const auto sizes = splitter->sizes();
+  const int first = sizes.at(splitter->indexOf(source));
+  const int second = sizes.at(splitter->indexOf(added));
+  QVERIFY(qAbs(first - second) <= 1);
+  QCOMPARE(sizes.at(splitter->indexOf(sibling)), siblingSize);
+  QCOMPARE(first + second + splitter->handleWidth(), sourceSize);
+}
 
 void WindowActionsTest::controlsTabBarVisibility() {
   GhosttyApp ghostty;
